@@ -30,7 +30,9 @@
 //!    are child rows.
 
 mod escape;
+mod fsx;
 mod git;
+mod localize;
 mod log;
 mod refs;
 mod repo;
@@ -40,34 +42,14 @@ mod worker;
 use escape::escape_markup;
 use git::Git;
 use repo::RepoInfo;
-use sicompass_sdk::ffon::FfonElement;
-use sicompass_sdk::localize;
-use sicompass_sdk::{
-    BuiltinManifest, ListItem, Provider, SettingDecl, register_builtin_manifest,
-    register_provider_factory,
+use sicompass_pdk::{
+    Descriptor, FfonElement, ListItem, Plugin, PollResult, ProviderOp, SearchResult, export_plugin,
 };
 use status::Status;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 
 pub use git::_set_test_no_network;
-
-/// Register this crate's Fluent bundles. Idempotent.
-///
-/// Called from `register()` *and* from every trait method that resolves a
-/// string: a provider built through the factory can be reached before
-/// `register()` has run on some paths, and an unresolved key renders as the key
-/// itself.
-pub fn register_translations() {
-    static ONCE: OnceLock<()> = OnceLock::new();
-    ONCE.get_or_init(|| {
-        let _ = localize::register_bundle("en-US", include_str!("../locales/en-US.ftl"));
-        let _ = localize::register_bundle("nl-BE", include_str!("../locales/nl-BE.ftl"));
-        let _ = localize::register_bundle("fr-BE", include_str!("../locales/fr-BE.ftl"));
-        let _ = localize::register_bundle("de-BE", include_str!("../locales/de-BE.ftl"));
-    });
-}
 
 // ---------------------------------------------------------------------------
 // Command ids
@@ -87,7 +69,7 @@ pub fn register_translations() {
 pub const CMD_OPEN: &str = "open repository";
 /// Go back to the folder listing.
 ///
-/// Handled but never listed in [`commands()`](Provider::commands): Escape at
+/// Handled but never listed in [`commands()`](Plugin::commands): Escape at
 /// the repository root is the way out, and a palette entry doing exactly that
 /// would be a second name for one action. The app dispatches it by name when
 /// Escape fires.
@@ -308,7 +290,7 @@ fn unescape_token(s: &str) -> String {
 /// Within a session that means "keep the repository open, this tail is the
 /// cursor's level". Across a restart it means only "that string named a
 /// repository, so browse its folder" — the repository view is not restored,
-/// see `Provider::set_current_path`.
+/// see `Plugin::set_current_path`.
 const REPO_MARKER: &str = "\u{1f}";
 
 /// Split a repository path into the repository's directory and the tokens
@@ -343,7 +325,8 @@ pub struct GitClientProvider {
     /// Where the cursor is inside the repository.
     segments: Vec<Segment>,
 
-    /// The configured `git` binary (the `gitBinary` setting).
+    /// The `git` started, on the user's `PATH`. Always `git`: the host starts
+    /// only the programs `plugin.json` lists, by name.
     binary: String,
 
     /// The commit message being composed, as typed.
@@ -383,7 +366,7 @@ pub struct GitClientProvider {
     needs_refresh: bool,
 
     /// Undo entries produced since the app last drained them.
-    timeline: Vec<sicompass_sdk::timeline::TimelineEntry>,
+    timeline: Vec<ProviderOp>,
 
     /// How often to fetch on our own, in minutes. Zero is off, and off is the
     /// default: an app that contacts a remote unattended can sit failing on a
@@ -420,7 +403,6 @@ impl Default for GitClientProvider {
 
 impl GitClientProvider {
     pub fn new() -> Self {
-        register_translations();
         GitClientProvider {
             view: View::Browse,
             browse_path: PathBuf::from("/"),
@@ -569,24 +551,19 @@ impl GitClientProvider {
         // than directories. Walking up to the nearest folder that does exist
         // lands the user near where they were instead of on an empty listing
         // they cannot navigate out of downwards.
-        while !self.browse_path.is_dir() && self.browse_path.pop() {}
+        while !fsx::is_dir(&self.browse_path) && self.browse_path.pop() {}
         if self.browse_path.as_os_str().is_empty() {
             self.browse_path = PathBuf::from("/");
         }
         self.sync_rendered_path();
 
-        let mut names: Vec<String> = Vec::new();
-        if let Ok(read_dir) = std::fs::read_dir(&self.browse_path) {
-            for entry in read_dir.flatten() {
-                // `metadata()` follows symlinks, so a symlink to a directory is
-                // offered as one. Entries whose metadata cannot be read
-                // (broken symlinks, races, permission holes) are skipped rather
-                // than shown as dead ends.
-                if entry.metadata().map(|m| m.is_dir()).unwrap_or(false) {
-                    names.push(entry.file_name().to_string_lossy().into_owned());
-                }
-            }
-        }
+        // Symlinks are followed, so a symlink to a directory is offered as
+        // one. Entries that cannot be read (broken symlinks, races, permission
+        // holes) are skipped rather than shown as dead ends.
+        let mut names: Vec<String> = fsx::list_dir(&self.browse_path)
+            .into_iter()
+            .filter(|name| fsx::is_dir(&self.browse_path.join(name)))
+            .collect();
         names.sort_by(|a, b| natord::compare_ignore_case(a, b));
 
         // `.git` is listed like any other folder. It is the plainest possible
@@ -1999,39 +1976,25 @@ impl GitClientProvider {
     /// fetch, discard, revert, cherry-pick, merge, rebase and amend are not:
     /// see the irreversibility notes in docs/undo-redo-timeline.md.
     fn record(&mut self, command: &str, parts: &[String], label_command: &str) {
-        use sicompass_sdk::timeline::TimelineEntry;
         let mut payload = FfonElement::new_obj(command);
         if let Some(obj) = payload.as_obj_mut() {
             for part in parts {
                 obj.push(FfonElement::new_str(part.clone()));
             }
         }
-        self.timeline.push(TimelineEntry::ProviderOp {
-            // Patched by the app to the real provider index; a provider emits
-            // with zero and an empty id.
-            provider_idx: 0,
+        self.timeline.push(ProviderOp {
             command: command.to_owned(),
-            payload,
+            payload: sicompass_pdk::encode_one(&payload),
             label: label_command.to_owned(),
         });
     }
 
     /// Apply a recorded action backwards (`undo`) or forwards again (`redo`).
-    fn reverse(
-        &mut self,
-        entry: &sicompass_sdk::timeline::TimelineEntry,
-        undo: bool,
-        error: &mut String,
-    ) {
-        use sicompass_sdk::timeline::TimelineEntry;
-        let TimelineEntry::ProviderOp {
-            command, payload, ..
-        } = entry
-        else {
-            return;
-        };
-        let parts: Vec<String> = payload
-            .as_obj()
+    fn reverse(&mut self, entry: &ProviderOp, undo: bool, error: &mut String) {
+        let command = &entry.command;
+        let parts: Vec<String> = sicompass_pdk::decode_one(&entry.payload)
+            .as_ref()
+            .and_then(|p| p.as_obj())
             .map(|o| {
                 o.children
                     .iter()
@@ -2120,26 +2083,146 @@ impl GitClientProvider {
 }
 
 // ---------------------------------------------------------------------------
-// Provider impl
+// What the plugin trait does not have: the answers `poll` batches, and the
+// command, undo and error calls in the shape the tests drive them.
 // ---------------------------------------------------------------------------
 
-#[async_trait::async_trait]
-impl Provider for GitClientProvider {
-    fn name(&self) -> &str {
+impl GitClientProvider {
+    pub fn name(&self) -> &str {
         "gitclient"
     }
 
-    fn display_name(&self) -> String {
-        register_translations();
+    pub fn display_name(&self) -> String {
         localize::t("gitclient-display-name")
     }
 
-    fn version(&self) -> Option<&str> {
-        Some(env!("CARGO_PKG_VERSION"))
+    fn at_root(&self) -> bool {
+        match self.view {
+            View::Browse => self.browse_path == Path::new("/"),
+            View::Repo => self.segments.is_empty(),
+        }
+    }
+
+    fn take_error(&mut self) -> Option<String> {
+        self.error.take()
+    }
+
+    // `command_label` is deliberately not overridden. The app renders the raw
+    // ids from `commands()` and never calls it (src/sicompass/src/list.rs), so
+    // an override here would be a translation surface no user ever reads, and
+    // the trait default already returns the id. That is also why the ids
+    // themselves are readable English rather than symbols.
+
+    fn handle_command(
+        &mut self,
+        cmd: &str,
+        element_key: &str,
+        _element_type: i32,
+        error: &mut String,
+    ) -> Option<FfonElement> {
+        // A command starting is the end of whatever the previous one was
+        // waiting for, so a half-answered confirmation cannot leak into it.
+        let pending = self.pending.take();
+        self.run_command(cmd, element_key, pending, error)
+    }
+
+    fn undo(&mut self, entry: &ProviderOp, error: &mut String) {
+        self.reverse(entry, true, error);
+    }
+
+    fn redo(&mut self, entry: &ProviderOp, error: &mut String) {
+        self.reverse(entry, false, error);
+    }
+
+    fn tick(&mut self) -> bool {
+        let mut redraw = false;
+
+        if let Some(outcome) = self.network.take_outcome() {
+            match outcome.error {
+                Some(message) => self.set_error(message),
+                None => {
+                    let mut a = localize::Args::new();
+                    a.set("what", outcome.label);
+                    self.set_error(localize::t_args("gitclient-done", &a));
+                }
+            }
+            self.invalidate();
+            self.needs_refresh = true;
+            redraw = true;
+        }
+
+        if self.autofetch_due() {
+            self.last_autofetch = Some(std::time::Instant::now());
+            let mut error = String::new();
+            self.start_network(
+                CMD_FETCH,
+                vec![vec!["fetch".into(), "--all".into()]],
+                &mut error,
+            );
+            // A busy worker is not worth reporting for a fetch nobody asked
+            // for: the interval simply starts again.
+        }
+
+        if self.watcher.as_ref().is_some_and(|w| w.take_changed()) {
+            self.invalidate();
+            if self.shallow_enough_to_refresh_silently() {
+                self.needs_refresh = true;
+            } else {
+                // Rewriting the level someone is reading a diff in is worse
+                // than being one keystroke out of date, so this only says so.
+                self.stale = true;
+            }
+            redraw = true;
+        }
+        redraw
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Plugin impl
+// ---------------------------------------------------------------------------
+
+impl Plugin for GitClientProvider {
+    fn new() -> Self {
+        GitClientProvider::new()
+    }
+
+    fn describe(&self) -> Descriptor {
+        Descriptor {
+            name: self.name().to_owned(),
+            display_name: self.display_name(),
+            version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+            // True, and it matters: see the path methods below.
+            path_is_filesystem: true,
+            ..Default::default()
+        }
+    }
+
+    fn init(&mut self) {
+        if let Some(v) = sicompass_pdk::host::get_setting(SETTING_AUTOFETCH) {
+            self.on_setting_change(SETTING_AUTOFETCH, &v);
+        }
+    }
+
+    /// Everything the app asks each frame: background results, the watcher,
+    /// and whether the listing has to be fetched again.
+    ///
+    /// `is_busy` is true while a remote-contacting command is running. It
+    /// only gates the Ctrl+Shift+T close confirmation, which is exactly right:
+    /// a half-finished push is worth being asked about.
+    fn poll(&mut self) -> PollResult {
+        let redraw = self.tick();
+        PollResult {
+            redraw,
+            needs_refresh: std::mem::take(&mut self.needs_refresh),
+            is_busy: self.network.busy(),
+            at_root: self.at_root(),
+            error: self.take_error(),
+            ..Default::default()
+        }
     }
 
     fn fetch(&mut self) -> Vec<FfonElement> {
-        register_translations();
         match self.view {
             View::Browse => self.browse_children(),
             View::Repo => self.repo_children(),
@@ -2249,14 +2332,7 @@ impl Provider for GitClientProvider {
         self.sync_rendered_path();
     }
 
-    fn at_root(&self) -> bool {
-        match self.view {
-            View::Browse => self.browse_path == Path::new("/"),
-            View::Repo => self.segments.is_empty(),
-        }
-    }
-
-    /// True, and it matters.
+    // `path_is_filesystem` (in `describe`) is true, and it matters.
     ///
     /// After a colon command returns no element and no error, the app either
     /// re-fetches every level along the visible path and keeps the cursor
@@ -2264,22 +2340,14 @@ impl Provider for GitClientProvider {
     /// (`false`). Staging a file has to leave the cursor on that file: someone
     /// staging a list of files one at a time cannot be thrown back to the
     /// section list after every one.
-    fn path_is_filesystem(&self) -> bool {
-        true
-    }
-
     /// Keep Ctrl+F out of this provider.
     ///
     /// `Some(_)` suppresses the app's generic FFON-tree traversal. That
     /// traversal teleports the cursor without telling the provider, and for a
     /// filesystem-path provider the app skips the resync that would otherwise
     /// repair it, so the path and the cursor would disagree from then on.
-    fn collect_extended_search_items(&self) -> Option<Vec<sicompass_sdk::SearchResultItem>> {
+    fn collect_extended_search_items(&self) -> Option<Vec<SearchResult>> {
         Some(Vec::new())
-    }
-
-    fn take_error(&mut self) -> Option<String> {
-        self.error.take()
     }
 
     // ---- Commands --------------------------------------------------------
@@ -2373,28 +2441,23 @@ impl Provider for GitClientProvider {
         cmds
     }
 
-    // `command_label` is deliberately not overridden. The app renders the raw
-    // ids from `commands()` and never calls it (src/sicompass/src/list.rs), so
-    // an override here would be a translation surface no user ever reads, and
-    // the trait default already returns the id. That is also why the ids
-    // themselves are readable English rather than symbols.
-
     fn handle_command(
         &mut self,
         cmd: &str,
         element_key: &str,
-        _element_type: i32,
-        error: &mut String,
-    ) -> Option<FfonElement> {
-        register_translations();
-        // A command starting is the end of whatever the previous one was
-        // waiting for, so a half-answered confirmation cannot leak into it.
-        let pending = self.pending.take();
-        self.run_command(cmd, element_key, pending, error)
+        element_type: i32,
+    ) -> Result<Option<FfonElement>, String> {
+        let mut error = String::new();
+        let out =
+            GitClientProvider::handle_command(self, cmd, element_key, element_type, &mut error);
+        if error.is_empty() {
+            Ok(out)
+        } else {
+            Err(error)
+        }
     }
 
     fn command_list_items(&self, cmd: &str) -> Vec<ListItem> {
-        register_translations();
         let Some(Pending::Confirm { command, target }) = &self.pending else {
             return Vec::new();
         };
@@ -2419,7 +2482,6 @@ impl Provider for GitClientProvider {
     }
 
     fn execute_command(&mut self, cmd: &str, selection: &str) -> bool {
-        register_translations();
         let Some(Pending::Confirm { command, target }) = self.pending.take() else {
             return false;
         };
@@ -2435,7 +2497,6 @@ impl Provider for GitClientProvider {
     // ---- Buttons, editing, background work -------------------------------
 
     fn on_button_press(&mut self, function_name: &str) {
-        register_translations();
         match function_name {
             BTN_LOAD_MORE => {
                 self.graph_limit += GRAPH_PAGE;
@@ -2456,7 +2517,6 @@ impl Provider for GitClientProvider {
     /// command decides which, and it is cleared either way so a later edit of
     /// the message cannot be read as an answer to an old question.
     fn commit_edit(&mut self, _old: &str, new: &str) -> bool {
-        register_translations();
         match self.pending.take() {
             Some(Pending::Text(op)) => {
                 self.perform_text(op, new.trim());
@@ -2478,102 +2538,46 @@ impl Provider for GitClientProvider {
         }
     }
 
-    fn tick(&mut self) -> bool {
-        let mut redraw = false;
-
-        if let Some(outcome) = self.network.take_outcome() {
-            match outcome.error {
-                Some(message) => self.set_error(message),
-                None => {
-                    let mut a = localize::Args::new();
-                    a.set("what", outcome.label);
-                    self.set_error(localize::t_args("gitclient-done", &a));
-                }
-            }
-            self.invalidate();
-            self.needs_refresh = true;
-            redraw = true;
-        }
-
-        if self.autofetch_due() {
-            self.last_autofetch = Some(std::time::Instant::now());
-            let mut error = String::new();
-            self.start_network(
-                CMD_FETCH,
-                vec![vec!["fetch".into(), "--all".into()]],
-                &mut error,
-            );
-            // A busy worker is not worth reporting for a fetch nobody asked
-            // for: the interval simply starts again.
-        }
-
-        if self.watcher.as_ref().is_some_and(|w| w.take_changed()) {
-            self.invalidate();
-            if self.shallow_enough_to_refresh_silently() {
-                self.needs_refresh = true;
-            } else {
-                // Rewriting the level someone is reading a diff in is worse
-                // than being one keystroke out of date, so this only says so.
-                self.stale = true;
-            }
-            redraw = true;
-        }
-        redraw
-    }
-
-    /// True while a remote-contacting command is running.
-    ///
-    /// Only gates the Ctrl+Shift+T close confirmation, which is exactly right: a
-    /// half-finished push is worth being asked about.
-    fn is_busy(&self) -> bool {
-        self.network.busy()
-    }
-
-    fn needs_refresh(&self) -> bool {
-        self.needs_refresh
-    }
-
-    fn clear_needs_refresh(&mut self) {
-        self.needs_refresh = false;
-    }
-
-    fn take_timeline_entries(&mut self) -> Vec<sicompass_sdk::timeline::TimelineEntry> {
+    fn take_timeline_entries(&mut self) -> Vec<ProviderOp> {
         std::mem::take(&mut self.timeline)
     }
 
-    async fn undo(&mut self, entry: &sicompass_sdk::timeline::TimelineEntry, error: &mut String) {
-        register_translations();
-        self.reverse(entry, true, error);
+    fn undo(&mut self, entry: &ProviderOp) -> Result<(), String> {
+        let mut error = String::new();
+        GitClientProvider::undo(self, entry, &mut error);
+        if error.is_empty() { Ok(()) } else { Err(error) }
     }
 
-    async fn redo(&mut self, entry: &sicompass_sdk::timeline::TimelineEntry, error: &mut String) {
-        register_translations();
-        self.reverse(entry, false, error);
+    fn redo(&mut self, entry: &ProviderOp) -> Result<(), String> {
+        let mut error = String::new();
+        GitClientProvider::redo(self, entry, &mut error);
+        if error.is_empty() { Ok(()) } else { Err(error) }
+    }
+
+    /// A network job, in the worker instance the host started for it.
+    fn run_task(&mut self, name: &str, input: &[u8]) -> Result<Vec<u8>, String> {
+        match name {
+            worker::TASK => worker::run_task(input),
+            other => Err(format!("gitclient has no task named `{other}`")),
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn on_task_event(&mut self, id: u64, event: sicompass_pdk::TaskEvent) {
+        self.network.on_task_event(id, event);
     }
 
     fn on_setting_change(&mut self, key: &str, value: &str) {
-        match key {
-            "gitBinary" => {
-                self.binary = if value.trim().is_empty() {
-                    "git".to_owned()
-                } else {
-                    value.trim().to_owned()
-                };
-                self.invalidate();
-            }
-            "gitAutofetchMinutes" => {
-                // Anything unparseable is off rather than a guess: a typo in a
-                // settings field must not start contacting a remote on a timer.
-                self.autofetch_minutes = value.trim().parse().unwrap_or(0);
-                self.last_autofetch = None;
-            }
-            _ => {}
+        if key == SETTING_AUTOFETCH {
+            // Anything unparseable is off rather than a guess: a typo in a
+            // settings field must not start contacting a remote on a timer.
+            self.autofetch_minutes = value.trim().parse().unwrap_or(0);
+            self.last_autofetch = None;
         }
     }
 
     fn cleanup(&mut self) {
-        // Stops the watcher thread. The network job is detached and clears its
-        // own flag, so there is nothing to join.
+        // The host stops a running network task itself.
         self.watcher = None;
     }
 }
@@ -2751,28 +2755,10 @@ fn is_binary(bytes: &[u8]) -> bool {
 // Registration
 // ---------------------------------------------------------------------------
 
-pub fn register() {
-    register_translations();
-    register_provider_factory("gitclient", || Box::new(GitClientProvider::new()));
-    register_builtin_manifest(
-        // Opt-in: not every user works with git, and the provider is useless
-        // without the binary. `BuiltinManifest::new` already defaults to
-        // opt-in, so there is no builder call to make that so.
-        //
-        // The section name is the display name with its space removed matched
-        // against `name()`, which is why the provider is `gitclient` and not
-        // `git`.
-        BuiltinManifest::new("gitclient", "git client").with_settings(vec![
-            SettingDecl::text("git client", "git binary path", "gitBinary", "git"),
-            SettingDecl::text(
-                "git client",
-                "fetch from the remote every N minutes, 0 to never",
-                "gitAutofetchMinutes",
-                "0",
-            ),
-        ]),
-    );
-}
+/// The setting (declared in `plugin.json`) for fetching on a timer.
+const SETTING_AUTOFETCH: &str = "gitAutofetchMinutes";
+
+export_plugin!(GitClientProvider);
 
 #[cfg(test)]
 mod tests {
@@ -3838,11 +3824,11 @@ mod tests {
         let entries = p.take_timeline_entries();
         assert_eq!(entries.len(), 1);
         let mut error = String::new();
-        sicompass_sdk::block_on(p.undo(&entries[0], &mut error));
+        p.undo(&entries[0], &mut error);
         assert!(error.is_empty(), "{error}");
         assert_eq!(p.status().unwrap().staged().count(), 0);
 
-        sicompass_sdk::block_on(p.redo(&entries[0], &mut error));
+        p.redo(&entries[0], &mut error);
         assert_eq!(p.status().unwrap().staged().count(), 1);
     }
 
@@ -3862,7 +3848,7 @@ mod tests {
         assert_eq!(entries.len(), 1);
 
         let mut error = String::new();
-        sicompass_sdk::block_on(p.undo(&entries[0], &mut error));
+        p.undo(&entries[0], &mut error);
         assert!(error.is_empty(), "{error}");
         assert_eq!(f.run(["rev-list", "--count", "HEAD"]), "1");
         p.invalidate();
@@ -3889,7 +3875,7 @@ mod tests {
         let entries = p.take_timeline_entries();
 
         let mut error = String::new();
-        sicompass_sdk::block_on(p.undo(&entries[0], &mut error));
+        p.undo(&entries[0], &mut error);
         assert!(error.is_empty(), "{error}");
         p.invalidate();
         assert!(p.status().unwrap().branch.unborn());
@@ -4154,7 +4140,7 @@ mod tests {
         // Back on main first: git will not delete the branch it is on.
         f.run(["checkout", "-q", "main"]);
         let mut error = String::new();
-        sicompass_sdk::block_on(p.undo(&entries[0], &mut error));
+        p.undo(&entries[0], &mut error);
         assert!(error.is_empty(), "{error}");
         assert!(!f.run(["branch", "--list", "side"]).contains("side"));
     }
@@ -4231,7 +4217,7 @@ mod tests {
         assert_eq!(entries.len(), 1);
 
         let mut error = String::new();
-        sicompass_sdk::block_on(p.undo(&entries[0], &mut error));
+        p.undo(&entries[0], &mut error);
         assert!(error.is_empty(), "{error}");
         assert_eq!(
             std::fs::read_to_string(f.path().join("a.txt")).unwrap(),
@@ -4386,21 +4372,14 @@ mod tests {
     }
 
     #[test]
-    fn the_git_binary_setting_is_picked_up() {
-        let mut p = GitClientProvider::new();
-        p.on_setting_change("gitBinary", "/usr/bin/git");
-        assert_eq!(p.binary, "/usr/bin/git");
-        // An empty value is a cleared field, not a request to run "".
-        p.on_setting_change("gitBinary", "  ");
-        assert_eq!(p.binary, "git");
-    }
-
-    #[test]
     fn extended_search_is_suppressed_for_this_provider() {
         // The app skips its cursor/path resync for filesystem-path providers,
         // so a Ctrl+F teleport would leave the two disagreeing from then on.
         let p = GitClientProvider::new();
-        assert_eq!(p.collect_extended_search_items(), Some(Vec::new()));
+        assert!(
+            p.collect_extended_search_items()
+                .is_some_and(|v| v.is_empty())
+        );
     }
 
     #[test]
@@ -4520,13 +4499,17 @@ mod locale_tests {
         }
     }
 
+    /// Where keys are used: the code, and the manifest (the Store's
+    /// description and the settings labels).
+    const CODE: [&str; 2] = [include_str!("lib.rs"), include_str!("../plugin.json")];
+
     /// Every key the code asks for has to be in the bundle.
     ///
     /// `t()` echoes an unknown key back, so a typo renders as
     /// `gitclient-somthing` on screen and reads as that out loud.
     #[test]
     fn every_key_the_code_uses_exists() {
-        let source = include_str!("lib.rs");
+        let source = CODE.concat();
         let defined = keys(EN);
         // Built rather than written out, so this test's own needle is not one
         // of the things it finds in its own source.
@@ -4544,7 +4527,7 @@ mod locale_tests {
     /// And nothing is defined that nothing uses.
     #[test]
     fn every_key_in_the_bundle_is_used() {
-        let source = include_str!("lib.rs");
+        let source = CODE.concat();
         for key in keys(EN) {
             assert!(
                 source.contains(&format!("\"{key}\"")),

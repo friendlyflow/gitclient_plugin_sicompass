@@ -1,6 +1,8 @@
 # Git-client provider strings — Belgian German.
 
 gitclient-display-name = git-Client
+gitclient-description = Ihre Repositories als Listen: stagen, committen, Branches, Stashes, Pull und Push, mit dem git auf Ihrem Computer.
+gitclient-setting-autofetch = alle N Minuten vom Remote abrufen, 0 fuer nie
 
 gitclient-head-branch = { $repo } auf { $branch }
 gitclient-head-detached = { $repo }, losgeloest bei { $oid }

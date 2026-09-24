@@ -1,6 +1,8 @@
 # Git-client provider strings — Belgian French.
 
 gitclient-display-name = client git
+gitclient-description = Vos depots sous forme de listes : indexer, valider, branches, remises, tirer et pousser, avec le git de votre ordinateur.
+gitclient-setting-autofetch = recuperer depuis le depot distant toutes les N minutes, 0 pour jamais
 
 gitclient-head-branch = { $repo } sur { $branch }
 gitclient-head-detached = { $repo }, detache sur { $oid }

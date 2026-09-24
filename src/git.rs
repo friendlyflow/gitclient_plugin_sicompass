@@ -10,10 +10,16 @@
 //! anyway. A subprocess adds no dependency, no entry in
 //! `THIRD-PARTY-LICENSES.html`, and reuses the user's own credential helpers,
 //! ssh agent and config exactly as their shell would.
+//!
+//! Inside the sandbox git is started through the host's `process` interface,
+//! which runs the one program `plugin.json` lists (`git`, resolved on the
+//! user's `PATH`). Natively, in the unit tests, it is `std::process`. Both get
+//! the same arguments and environment from here. The one difference: the host
+//! takes arguments as strings, so in the sandbox a file name that is not valid
+//! UTF-8 reaches git with its invalid bytes replaced.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 // ---------------------------------------------------------------------------
@@ -121,54 +127,71 @@ impl Output {
 // Building the command
 // ---------------------------------------------------------------------------
 
-/// A `git` invocation with this crate's hygiene already applied.
+/// What goes before the subcommand on every call.
 ///
 /// `cwd` is where git is pointed; for repository work that is the worktree
 /// root, for discovery it is whatever folder is being probed.
-fn base_command(binary: &str, cwd: &Path) -> Command {
-    let mut cmd = Command::new(binary);
+fn global_args(cwd: &Path) -> Vec<OsString> {
+    vec![
+        // `-C` before the subcommand, and `--no-pager` before it too: `git log
+        // --no-pager` is not the same thing and is silently accepted as a
+        // pathspec error. stdout is not a tty here so no pager would start
+        // anyway, but the user's `core.pager` can be set to something that does
+        // not check.
+        "-C".into(),
+        cwd.as_os_str().to_owned(),
+        "--no-pager".into(),
+        // Raw UTF-8 in output that is not NUL-separated, instead of git's
+        // octal-escaped, double-quoted form for anything non-ASCII.
+        "-c".into(),
+        "core.quotePath=false".into(),
+    ]
+}
 
-    // `-C` before the subcommand, and `--no-pager` before it too: `git log
-    // --no-pager` is not the same thing and is silently accepted as a pathspec
-    // error. stdout is not a tty here so no pager would start anyway, but the
-    // user's `core.pager` can be set to something that does not check.
-    cmd.arg("-C").arg(cwd);
-    cmd.arg("--no-pager");
-    // Raw UTF-8 in output that is not NUL-separated, instead of git's
-    // octal-escaped, double-quoted form for anything non-ASCII.
-    cmd.arg("-c").arg("core.quotePath=false");
+/// Inherited variables removed from every call.
+///
+/// If sicompass itself was launched from inside a repository (which, being a
+/// development tool, it usually is) any of these silently overrides `-C` on
+/// every single call, and the plugin would report on sicompass's own repo no
+/// matter which one the user opened.
+const UNSET: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_PREFIX",
+];
 
-    // If sicompass itself was launched from inside a repository — which, being
-    // a development tool, it usually is — any of these inherited variables
-    // silently overrides `-C` on every single call, and the provider would
-    // report on sicompass's own repo no matter which one the user opened.
-    for var in [
-        "GIT_DIR",
-        "GIT_WORK_TREE",
-        "GIT_INDEX_FILE",
-        "GIT_COMMON_DIR",
-        "GIT_OBJECT_DIRECTORY",
-        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-        "GIT_CEILING_DIRECTORIES",
-        "GIT_PREFIX",
-    ] {
-        cmd.env_remove(var);
-    }
-
+/// Variables set on every call.
+const ENV: &[(&str, &str)] = &[
     // Nothing here has a terminal to prompt on, and a blocked prompt would hang
-    // the thread that is driving the render loop. `GIT_TERMINAL_PROMPT` covers
-    // the terminal case; without the two askpass variables a graphical
-    // ssh-askpass can still appear over the app.
-    cmd.env("GIT_TERMINAL_PROMPT", "0");
-    cmd.env("GIT_ASKPASS", "");
-    cmd.env("SSH_ASKPASS", "");
+    // the render loop. `GIT_TERMINAL_PROMPT` covers the terminal case; without
+    // the two askpass variables a graphical ssh-askpass can still appear over
+    // the app.
+    ("GIT_TERMINAL_PROMPT", "0"),
+    ("GIT_ASKPASS", ""),
+    ("SSH_ASKPASS", ""),
     // Stable, parseable output regardless of the user's locale.
-    cmd.env("LC_ALL", "C");
+    ("LC_ALL", "C"),
     // Read-only commands otherwise take the index lock to refresh stat info,
     // which fights with a rebase or a commit running in the user's own shell.
     // (It does nothing for the write commands, which is why those are
     // serialised through one worker instead.)
-    cmd.env("GIT_OPTIONAL_LOCKS", "0");
+    ("GIT_OPTIONAL_LOCKS", "0"),
+];
+
+/// Run `binary` with `args` (the global ones included) to completion.
+#[cfg(not(target_arch = "wasm32"))]
+fn exec(binary: &str, args: &[OsString]) -> Output {
+    let mut cmd = std::process::Command::new(binary);
+    cmd.args(args);
+    for var in UNSET {
+        cmd.env_remove(var);
+    }
+    cmd.envs(ENV.iter().copied());
 
     #[cfg(windows)]
     {
@@ -178,7 +201,73 @@ fn base_command(binary: &str, cwd: &Path) -> Command {
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
 
-    cmd
+    match cmd.output() {
+        Ok(out) => Output {
+            code: out.status.code(),
+            stdout: out.stdout,
+            stderr: String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+        },
+        Err(e) => Output {
+            code: None,
+            stdout: Vec::new(),
+            stderr: e.to_string(),
+        },
+    }
+}
+
+/// Run `binary` with `args` to completion, through the host.
+///
+/// The host's reads never block, so this reads, waits a moment and reads
+/// again until git has exited. The host reports the exit only once all of the
+/// output has arrived, so what is read after it is the rest.
+#[cfg(target_arch = "wasm32")]
+fn exec(binary: &str, args: &[OsString]) -> Output {
+    use sicompass_pdk::process::Child;
+    const CHUNK: u32 = 1 << 20;
+
+    let args: Vec<String> = args
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    let env: Vec<(String, String)> = ENV
+        .iter()
+        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+        .collect();
+    let unset: Vec<String> = UNSET.iter().map(|v| (*v).to_owned()).collect();
+    let child = match Child::spawn(binary, &args, None, &env, &unset, None) {
+        Ok(c) => c,
+        Err(e) => {
+            return Output {
+                code: None,
+                stdout: Vec::new(),
+                stderr: e,
+            };
+        }
+    };
+
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+    let drain = |stdout: &mut Vec<u8>, stderr: &mut Vec<u8>| loop {
+        let out = child.read(CHUNK);
+        let err = child.read_stderr(CHUNK);
+        if out.is_empty() && err.is_empty() {
+            break;
+        }
+        stdout.extend(out);
+        stderr.extend(err);
+    };
+    let code = loop {
+        let exited = child.try_wait();
+        drain(&mut stdout, &mut stderr);
+        if let Some(code) = exited {
+            break code;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    };
+    Output {
+        code: Some(code),
+        stdout,
+        stderr: String::from_utf8_lossy(&stderr).trim().to_owned(),
+    }
 }
 
 /// Wrap a path as an explicit-literal pathspec.
@@ -199,7 +288,7 @@ pub fn literal_pathspec(path: &[u8]) -> OsString {
 /// UTF-8 comes back from git as raw bytes, and lossy conversion replaces them
 /// with U+FFFD. Handing *that* back to `git add` addresses a file that does not
 /// exist, and the stage silently does nothing.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_arch = "wasm32")))]
 pub fn os_string_from_bytes(bytes: &[u8]) -> OsString {
     use std::os::unix::ffi::OsStringExt;
     OsString::from_vec(bytes.to_vec())
@@ -207,7 +296,8 @@ pub fn os_string_from_bytes(bytes: &[u8]) -> OsString {
 
 /// Windows has no byte-oriented path API, and git on Windows emits UTF-8
 /// regardless of the filesystem encoding, so lossy conversion is exact here.
-#[cfg(not(unix))]
+/// In the sandbox arguments travel to the host as strings anyway.
+#[cfg(not(all(unix, not(target_arch = "wasm32"))))]
 pub fn os_string_from_bytes(bytes: &[u8]) -> OsString {
     OsString::from(String::from_utf8_lossy(bytes).into_owned())
 }
@@ -256,20 +346,9 @@ impl Git {
             }
         }
 
-        let mut cmd = base_command(&self.binary, &self.cwd);
-        cmd.args(&args);
-        match cmd.output() {
-            Ok(out) => Output {
-                code: out.status.code(),
-                stdout: out.stdout,
-                stderr: String::from_utf8_lossy(&out.stderr).trim().to_owned(),
-            },
-            Err(e) => Output {
-                code: None,
-                stdout: Vec::new(),
-                stderr: e.to_string(),
-            },
-        }
+        let mut all = global_args(&self.cwd);
+        all.extend(args);
+        exec(&self.binary, &all)
     }
 
     /// Run git, turning a non-zero exit into a [`GitError`].
@@ -325,6 +404,16 @@ impl Git {
         let bytes = self.run(args)?;
         let s = String::from_utf8_lossy(&bytes);
         Ok(s.trim_end_matches(['\n', '\r']).to_owned())
+    }
+
+    /// The directory git is pointed at.
+    pub fn cwd(&self) -> &Path {
+        &self.cwd
+    }
+
+    /// The program run.
+    pub fn binary(&self) -> &str {
+        &self.binary
     }
 
     /// A copy pointed at a different directory, keeping the configured binary.

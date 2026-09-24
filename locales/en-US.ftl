@@ -1,6 +1,8 @@
 # Git-client provider strings — English (source/fallback).
 
 gitclient-display-name = git client
+gitclient-description = Your repositories as lists: stage, commit, branch, stash, pull and push, with the git on your computer.
+gitclient-setting-autofetch = fetch from the remote every N minutes, 0 to never
 
 # ---------------------------------------------------------------------------
 # Repository root

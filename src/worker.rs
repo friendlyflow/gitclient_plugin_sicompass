@@ -1,16 +1,17 @@
 //! The two things that must not run on the render thread.
 //!
-//! * [`Network`] runs `fetch`, `pull` and `push` on a background thread. They
+//! * [`Network`] runs `fetch`, `pull` and `push` in the background. They
 //!   contact a remote, so they take as long as the network does, and a frame
-//!   spent waiting is a frame the app does not draw.
+//!   spent waiting is a frame the app does not draw. Inside the sandbox that is
+//!   a host background task (a second instance of this plugin, see
+//!   [`run_task`]); natively, in the unit tests, a thread.
 //! * [`Watcher`] notices that the repository changed underneath the app,
 //!   without running `git status` on a timer.
 
 use crate::git::Git;
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 // ---------------------------------------------------------------------------
 // Network jobs
@@ -25,20 +26,51 @@ pub struct Outcome {
     pub error: Option<String>,
 }
 
+/// Run `steps` in order, stopping at the first failure. `None` on success,
+/// otherwise the message naming the step that failed.
+///
+/// Stopping is what makes "commit and sync" a pull followed by a push rather
+/// than two independent things that can both half-happen.
+pub fn run_steps(git: &Git, steps: &[Vec<String>]) -> Option<String> {
+    for step in steps {
+        let out = git.try_run(step);
+        if !out.ok() {
+            let sub = step.first().cloned().unwrap_or_default();
+            let first = out
+                .stderr
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("failed")
+                .trim()
+                .to_owned();
+            return Some(format!("git {sub}: {first}"));
+        }
+    }
+    None
+}
+
 /// Runs one remote-contacting git command at a time.
 ///
 /// Single-flight rather than a queue: `GIT_OPTIONAL_LOCKS=0` keeps the *read*
 /// commands off `index.lock`, but a `pull` very much takes it, and two of them
 /// at once fail with three lines of advice about deleting a lock file by hand.
 /// Refusing the second is a better answer than racing it.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct Network {
-    in_flight: Arc<AtomicBool>,
     /// What is running, for the row that says so.
-    running: Arc<Mutex<Option<String>>>,
-    /// Filled by the worker, drained by `tick`.
-    done: Arc<Mutex<Option<Outcome>>>,
+    running: RefCell<Option<String>>,
+    /// Filled when the job ends, drained by `tick`.
+    done: RefCell<Option<Outcome>>,
+    /// The host task running the job.
+    #[cfg(target_arch = "wasm32")]
+    task: Cell<Option<u64>>,
+    /// Natively: the thread's result, when it has one.
+    #[cfg(not(target_arch = "wasm32"))]
+    thread: RefCell<Option<std::sync::mpsc::Receiver<Option<String>>>>,
 }
+
+/// The task a network job runs as.
+pub const TASK: &str = "network";
 
 impl Network {
     pub fn new() -> Network {
@@ -46,72 +78,159 @@ impl Network {
     }
 
     pub fn busy(&self) -> bool {
-        self.in_flight.load(Ordering::Acquire)
+        self.collect();
+        self.running.borrow().is_some()
     }
 
     /// What is running right now, if anything.
     pub fn running(&self) -> Option<String> {
-        self.running.lock().ok().and_then(|g| g.clone())
+        self.collect();
+        self.running.borrow().clone()
     }
 
     /// Take the result of the last finished job, if it has not been taken yet.
     pub fn take_outcome(&self) -> Option<Outcome> {
-        self.done.lock().ok().and_then(|mut g| g.take())
+        self.collect();
+        self.done.borrow_mut().take()
+    }
+
+    fn finish(&self, error: Option<String>) {
+        if let Some(label) = self.running.borrow_mut().take() {
+            *self.done.borrow_mut() = Some(Outcome { label, error });
+        }
     }
 
     /// Start a job. Returns `false` when one is already running.
     ///
-    /// `steps` is run in order and stops at the first failure, which is what
-    /// makes "commit and sync" a pull followed by a push rather than two
-    /// independent things that can both half-happen.
+    /// `steps` is run in order and stops at the first failure (see
+    /// [`run_steps`]).
     pub fn start(&self, git: Git, label: String, steps: Vec<Vec<String>>) -> bool {
-        if self.in_flight.swap(true, Ordering::AcqRel) {
+        if self.busy() {
             return false;
         }
-        if let Ok(mut g) = self.running.lock() {
-            *g = Some(label.clone());
+        if !self.spawn(git, steps) {
+            return false;
         }
-
-        let in_flight = Arc::clone(&self.in_flight);
-        let running = Arc::clone(&self.running);
-        let done = Arc::clone(&self.done);
-
-        std::thread::spawn(move || {
-            // A panic anywhere in here would otherwise leave the flag set and
-            // no further job could ever start.
-            struct ClearOnDrop(Arc<AtomicBool>, Arc<Mutex<Option<String>>>);
-            impl Drop for ClearOnDrop {
-                fn drop(&mut self) {
-                    if let Ok(mut g) = self.1.lock() {
-                        *g = None;
-                    }
-                    self.0.store(false, Ordering::Release);
-                }
-            }
-            let _guard = ClearOnDrop(in_flight, running);
-
-            let mut error = None;
-            for step in steps {
-                let out = git.try_run(&step);
-                if !out.ok() {
-                    let sub = step.first().cloned().unwrap_or_default();
-                    let first = out
-                        .stderr
-                        .lines()
-                        .find(|l| !l.trim().is_empty())
-                        .unwrap_or("failed")
-                        .trim()
-                        .to_owned();
-                    error = Some(format!("git {sub}: {first}"));
-                    break;
-                }
-            }
-            if let Ok(mut g) = done.lock() {
-                *g = Some(Outcome { label, error });
-            }
-        });
+        *self.running.borrow_mut() = Some(label);
         true
     }
+
+    /// The job travels as the same bytes a host task gets, so these tests
+    /// cover that trip too.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn spawn(&self, git: Git, steps: Vec<Vec<String>>) -> bool {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let input = encode_job(&git, &steps);
+        std::thread::spawn(move || {
+            // A panic drops `tx`, which `collect` reads as a failure, so the
+            // flag cannot stay set.
+            let _ = tx.send(run_task(&input).map_or_else(Some, |out| decode_result(&out)));
+        });
+        *self.thread.borrow_mut() = Some(rx);
+        true
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn collect(&self) {
+        use std::sync::mpsc::TryRecvError;
+        let result = match self.thread.borrow().as_ref().map(|rx| rx.try_recv()) {
+            None | Some(Err(TryRecvError::Empty)) => return,
+            Some(Ok(error)) => error,
+            Some(Err(TryRecvError::Disconnected)) => Some("git: the job stopped".to_owned()),
+        };
+        *self.thread.borrow_mut() = None;
+        self.finish(result);
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn spawn(&self, git: Git, steps: Vec<Vec<String>>) -> bool {
+        match sicompass_pdk::tasks::spawn(TASK, &encode_job(&git, &steps)) {
+            Ok(id) => {
+                self.task.set(Some(id));
+                true
+            }
+            Err(e) => {
+                sicompass_pdk::host::log(&format!("gitclient: {e}"));
+                false
+            }
+        }
+    }
+
+    /// The task reports through [`Network::on_task_event`] instead.
+    #[cfg(target_arch = "wasm32")]
+    fn collect(&self) {}
+
+    /// The end of the task started by [`Network::start`].
+    #[cfg(target_arch = "wasm32")]
+    pub fn on_task_event(&self, id: u64, event: sicompass_pdk::TaskEvent) {
+        use sicompass_pdk::TaskEvent;
+        if self.task.get() != Some(id) {
+            return;
+        }
+        if let TaskEvent::Done(result) = event {
+            self.task.set(None);
+            self.finish(match result {
+                Ok(bytes) => decode_result(&bytes),
+                Err(e) => Some(format!("git: {e}")),
+            });
+        }
+    }
+}
+
+/// A job as the task's input: the folder, the binary, then one `Obj` per step.
+pub fn encode_job(git: &Git, steps: &[Vec<String>]) -> Vec<u8> {
+    use sicompass_sdk::ffon::FfonElement;
+    let mut out = vec![
+        FfonElement::new_str(git.cwd().to_string_lossy().into_owned()),
+        FfonElement::new_str(git.binary().to_owned()),
+    ];
+    for step in steps {
+        let mut obj = FfonElement::new_obj("step");
+        if let Some(o) = obj.as_obj_mut() {
+            for arg in step {
+                o.push(FfonElement::new_str(arg.clone()));
+            }
+        }
+        out.push(obj);
+    }
+    sicompass_sdk::ffon::serialize_binary(&out)
+}
+
+/// The inverse of [`encode_job`].
+pub fn decode_job(bytes: &[u8]) -> Option<(Git, Vec<Vec<String>>)> {
+    let elems = sicompass_sdk::ffon::deserialize_binary(bytes);
+    let mut it = elems.iter();
+    let cwd = it.next()?.as_str()?.to_owned();
+    let binary = it.next()?.as_str()?.to_owned();
+    let steps = it
+        .map(|e| {
+            e.as_obj()
+                .map(|o| {
+                    o.children
+                        .iter()
+                        .filter_map(|c| c.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+        .collect();
+    Some((Git::new(binary, cwd), steps))
+}
+
+/// A job's result as the task's output: empty on success, else the message.
+pub fn encode_result(error: Option<String>) -> Vec<u8> {
+    error.map(String::into_bytes).unwrap_or_default()
+}
+
+/// The inverse of [`encode_result`].
+pub fn decode_result(bytes: &[u8]) -> Option<String> {
+    (!bytes.is_empty()).then(|| String::from_utf8_lossy(bytes).into_owned())
+}
+
+/// The task itself, in the worker instance: run the job, report how it ended.
+pub fn run_task(input: &[u8]) -> Result<Vec<u8>, String> {
+    let (git, steps) = decode_job(input).ok_or("gitclient: a malformed job")?;
+    Ok(encode_result(run_steps(&git, &steps)))
 }
 
 // ---------------------------------------------------------------------------
@@ -120,7 +239,7 @@ impl Network {
 
 /// Notices that something changed the repository from outside the app.
 ///
-/// It stats three paths rather than running `git status`, because it runs on a
+/// It stats four paths rather than running `git status`, because it runs on a
 /// timer: `git status` on a large repository is hundreds of milliseconds and a
 /// process spawn, and doing that once a second forever to answer "did anything
 /// happen" is the wrong trade. `HEAD` covers checkout and commit, `index`
@@ -129,11 +248,15 @@ impl Network {
 /// It does **not** watch the worktree. Editing a file changes `git status`
 /// without touching `.git`, so an edit made in another window is picked up on
 /// the next refresh rather than immediately. Watching a whole worktree means
-/// an inotify watch per directory and a rebuild every time a build writes to
-/// `target/`, which is a much worse trade than being one keystroke stale.
+/// a watch per directory and a rebuild every time a build writes to `target/`,
+/// which is a much worse trade than being one keystroke stale.
+///
+/// There is no thread: the plugin asks from `poll`, every frame, and the paths
+/// are statted at most once per [`POLL_INTERVAL`] of those asks.
 pub struct Watcher {
-    changed: Arc<AtomicBool>,
-    alive: Arc<AtomicBool>,
+    watched: [PathBuf; 4],
+    last: RefCell<Vec<Option<SystemTime>>>,
+    checked: Cell<Instant>,
 }
 
 impl Watcher {
@@ -143,48 +266,35 @@ impl Watcher {
     /// the one every worktree shares (its `refs`). For the main worktree they
     /// are the same directory.
     pub fn start(git_dir: PathBuf, common_dir: PathBuf) -> Watcher {
-        let changed = Arc::new(AtomicBool::new(false));
-        let alive = Arc::new(AtomicBool::new(true));
-
-        let thread_changed = Arc::clone(&changed);
-        let thread_alive = Arc::clone(&alive);
-        std::thread::spawn(move || {
-            let watched = [
-                git_dir.join("HEAD"),
-                git_dir.join("index"),
-                common_dir.join("refs"),
-                // Written by rebase, merge and cherry-pick, so an operation
-                // running in the user's own shell shows up here.
-                common_dir.join("packed-refs"),
-            ];
-            let mut last = stamps(&watched);
-            while thread_alive.load(Ordering::Acquire) {
-                std::thread::sleep(POLL_INTERVAL);
-                if !thread_alive.load(Ordering::Acquire) {
-                    break;
-                }
-                let now = stamps(&watched);
-                if now != last {
-                    last = now;
-                    thread_changed.store(true, Ordering::Release);
-                }
-            }
-        });
-
-        Watcher { changed, alive }
+        let watched = [
+            git_dir.join("HEAD"),
+            git_dir.join("index"),
+            common_dir.join("refs"),
+            // Written by rebase, merge and cherry-pick, so an operation
+            // running in the user's own shell shows up here.
+            common_dir.join("packed-refs"),
+        ];
+        let last = RefCell::new(stamps(&watched));
+        Watcher {
+            watched,
+            last,
+            checked: Cell::new(Instant::now()),
+        }
     }
 
-    /// Take the "something changed" flag, clearing it.
+    /// Whether something changed since the last time this said so.
     pub fn take_changed(&self) -> bool {
-        self.changed.swap(false, Ordering::AcqRel)
-    }
-}
-
-impl Drop for Watcher {
-    fn drop(&mut self) {
-        // The thread checks this each time round, so it exits within one
-        // interval rather than outliving the tab that started it.
-        self.alive.store(false, Ordering::Release);
+        if self.checked.get().elapsed() < POLL_INTERVAL {
+            return false;
+        }
+        self.checked.set(Instant::now());
+        let now = stamps(&self.watched);
+        let mut last = self.last.borrow_mut();
+        if *last == now {
+            return false;
+        }
+        *last = now;
+        true
     }
 }
 
@@ -313,16 +423,47 @@ mod tests {
     }
 
     #[test]
-    fn a_watcher_stops_when_it_is_dropped() {
-        // The thread outliving its tab would keep stating a directory nobody
-        // is looking at, once a second, for the life of the process.
+    fn a_job_travels_to_the_task_and_back() {
+        // The worker instance shares nothing with the UI one, so the job has
+        // to survive the trip as bytes: a commit message with a newline in
+        // it, say.
+        let git = Git::new("git", "/some/repo");
+        let steps = vec![
+            vec!["pull".to_owned(), "--ff-only".to_owned()],
+            vec![
+                "commit".to_owned(),
+                "-m".to_owned(),
+                "two\nlines".to_owned(),
+            ],
+        ];
+        let (back, back_steps) = decode_job(&encode_job(&git, &steps)).unwrap();
+        assert_eq!(back.cwd(), Path::new("/some/repo"));
+        assert_eq!(back.binary(), "git");
+        assert_eq!(back_steps, steps);
+
+        assert_eq!(decode_result(&encode_result(None)), None);
+        assert_eq!(
+            decode_result(&encode_result(Some("git push: rejected".into()))),
+            Some("git push: rejected".to_owned())
+        );
+    }
+
+    #[test]
+    fn the_task_runs_the_job() {
         let f = Fixture::new();
-        let info = crate::repo::discover(&f.git(), &f.path()).unwrap();
-        let alive = {
-            let w = Watcher::start(info.git_dir.clone(), info.common_dir.clone());
-            Arc::clone(&w.alive)
-        };
-        assert!(!alive.load(Ordering::Acquire), "drop clears the alive flag");
+        let ok = run_task(&encode_job(&f.git(), &[vec!["--version".to_owned()]])).unwrap();
+        assert_eq!(decode_result(&ok), None);
+        let bad = run_task(&encode_job(
+            &f.git(),
+            &[vec![
+                "rev-parse".to_owned(),
+                "--verify".to_owned(),
+                "nope".to_owned(),
+            ]],
+        ))
+        .unwrap();
+        assert!(decode_result(&bad).unwrap().starts_with("git rev-parse:"));
+        assert!(run_task(b"not a job").is_err());
     }
 
     fn wait_for(n: &Network) -> Outcome {
