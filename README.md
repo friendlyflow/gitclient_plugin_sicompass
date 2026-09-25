@@ -1,4 +1,4 @@
-# gitclient_plugin_sicompass
+# gitclient-plugin-sicompass
 
 *Your repositories, in Sicompass.*
 
